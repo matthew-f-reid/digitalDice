@@ -115,7 +115,6 @@ Estimated draw is roughly 100–150 mA on average, so a 6-hour session needs abo
 
 | Symptom | Likely cause and fix |
 |---|---|
-| Compile errors about duplicate `setup()`, `loop()` or variables | More than one `.ino` in the sketch folder. Keep one, named to match the folder |
 | Constant hum from the speaker | Shared ground path with the display. Use a star ground |
 | Dial mode flickers on its own | ADC noise near a zone boundary. The settle timer and hysteresis handle most of it. For the rest, add a 0.1 µF ceramic capacitor from A2 to GND and keep the pot wire away from the CLK/DIO wires |
 | First or last sound mode hard to reach | Sweep the dial fully to both ends so the auto-calibration learns its real range |
