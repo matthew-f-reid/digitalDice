@@ -59,6 +59,7 @@ TM1637Display display(CLK, DIO, TM1637_BIT_DELAY);
 
 int brightness = 3;
 int dice1 = 1, dice2 = 1;   // start at a valid value so power-up doesn't show 0/0
+bool displayDirty = true;   // set true whenever the display was wiped/changed outside displayNum()
 
 // Small helper struct so both buttons share the same debounce/edge-detect logic
 struct DebouncedButton {
@@ -99,7 +100,10 @@ const float POT_ZONE_MARGIN_FRACTION = 0.25f;
 // boundary (e.g. coupled in from the display's CLK/DIO lines) can nudge the
 // reading back and forth across the boundary and make the mode flicker
 // between two values with the dial completely untouched.
-const unsigned long POT_SETTLE_MS = 150;
+const unsigned long POT_SETTLE_MS = 60;
+// The pot is sampled on a fixed timer (not once per loop pass) so the amount
+// of smoothing doesn't depend on how fast the loop happens to run.
+const unsigned long POT_SAMPLE_MS = 5;
 int candidateMode = 2;
 unsigned long candidateSince = 0;
 
@@ -241,9 +245,7 @@ void confirmSoundModeChange() {
   Serial.print("Sound mode -> ");
   Serial.println(soundMode);
 
-  tone(SPEAKER_OUT, 700 + soundMode * 90, 60);
-  delay(70);
-  noTone(SPEAKER_OUT);
+  tone(SPEAKER_OUT, 700 + soundMode * 90, 60); // tone() with a duration doesn't block
 }
 
 // Reads the potentiometer, smooths it, and maps it onto the sound-mode
@@ -254,20 +256,37 @@ void confirmSoundModeChange() {
 // noise sitting right on a zone boundary from endlessly flip-flopping
 // between two adjacent modes.
 void updateSoundModeFromPot() {
+  static unsigned long lastSample = 0;
+  if (millis() - lastSample < POT_SAMPLE_MS) return;
+  lastSample = millis();
+
   int raw = analogRead(SOUND_POT_PIN);
-  smoothedPot = (smoothedPot * 7 + raw) / 8; // heavier low-pass than before
+  smoothedPot = (smoothedPot * 3 + raw) / 4; // light low-pass; hysteresis does the heavy lifting
 
   if (smoothedPot < potMin) potMin = smoothedPot;
   if (smoothedPot > potMax) potMax = smoothedPot;
   if (potMax <= potMin) return; // not enough range observed yet
 
-  int mapped = map(smoothedPot, potMin, potMax, 0, NUM_SOUND_MODES - 1);
+  // Split the usable range into NUM_SOUND_MODES EQUAL zones. (Arduino's map()
+  // can't be used for this: with an output of 0..N-1 it only returns the
+  // top value when the input is exactly at its maximum, so the first and last
+  // modes end up one ADC count wide and almost impossible to land on.)
+  // A small trim at each end means the extreme modes still work when noise
+  // has stretched the learned min/max slightly.
+  int trim = (potMax - potMin) / 32;     // about 3% at each end
+  int lo = potMin + trim;
+  int hi = potMax - trim;
+  int usable = hi - lo + 1;
+  if (usable < 1) return;
+
+  int pos = constrain(smoothedPot, lo, hi) - lo;
+  int mapped = (int)((long)pos * NUM_SOUND_MODES / usable);
   mapped = constrain(mapped, 0, NUM_SOUND_MODES - 1);
 
-  float zoneWidth = (float)(potMax - potMin) / NUM_SOUND_MODES;
+  float zoneWidth = (float)usable / NUM_SOUND_MODES;
   int margin = (int)(zoneWidth * POT_ZONE_MARGIN_FRACTION);
-  int zoneLow  = potMin + (int)(soundMode * zoneWidth) - margin;
-  int zoneHigh = potMin + (int)((soundMode + 1) * zoneWidth) + margin;
+  int zoneLow  = lo + (int)(soundMode * zoneWidth) - margin;
+  int zoneHigh = lo + (int)((soundMode + 1) * zoneWidth) + margin;
 
   if (smoothedPot < zoneLow || smoothedPot > zoneHigh) {
     if (mapped != candidateMode) {
@@ -290,10 +309,13 @@ void playerRoll(int *die1, int *die2) {
   *die1 = random(1, 7);
   *die2 = random(1, 7);
 
-  Serial.print("Rolled: ");
+  // Machine-readable line for DiceLogger.py: ROLL,<die1>,<die2>,<sound mode>
+  Serial.print("ROLL,");
   Serial.print(*die1);
-  Serial.print(" and ");
-  Serial.println(*die2);
+  Serial.print(",");
+  Serial.print(*die2);
+  Serial.print(",");
+  Serial.println(soundMode);
 }
 
 void spinAnimation() {
@@ -306,24 +328,66 @@ void spinAnimation() {
   }
   noTone(SPEAKER_OUT);
   display.clear();
+  displayDirty = true;
 }
 
+// ---------------- Roll timestamp sent back by Python ----------------
+// After saving a roll, DiceLogger.py replies with "YYYY-MM-DD HH:MM:SS".
+// The 4-digit display can't show all of that, so it shows the time (HH:MM)
+// for STAMP_PHASE_MS, then the date (DDMM) for STAMP_PHASE_MS, then goes
+// back to the dice.
+int stampHour = 0, stampMinute = 0, stampDay = 0, stampMonth = 0;
+unsigned long stampShowStart = 0;
+bool stampActive = false;
+const unsigned long STAMP_PHASE_MS = 2000;
+
 // Uses all 4 digits of the TM1637: die 1 on the far left, die 2 on the far
-// right, always. The two center digits show the current sound mode (0-20,
+// right, always. The two center digits show the current sound mode (0-15,
 // with a leading zero so it fills both positions) only for MODE_DISPLAY_MS
 // after it last changed - otherwise they're left blank so just the dice show.
+// While a roll timestamp is being shown, it takes over the whole display.
+//
+// The display is only rewritten when something visible changed. Redrawing it
+// on every pass of loop() made the loop slow (every redraw is several ms of
+// bit-banged TM1637 traffic), which delayed pot changes appearing on screen.
 void displayNum(int num, int num2, int mode) {
-  display.setBrightness(brightness, true);
-  display.showNumberDecEx(num, 0, false, 1, 0);   // position 0: die 1
+  static int lastView = -1, lastNum = -1, lastNum2 = -1, lastMode = -1;
 
-  if (millis() < modeDisplayUntil) {
-    display.showNumberDecEx(mode, 0, true, 2, 1); // positions 1-2: sound mode
-  } else {
-    uint8_t blank[2] = { 0, 0 };
-    display.setSegments(blank, 2, 1);             // positions 1-2: blank
+  // 0 = timestamp time, 1 = timestamp date, 2 = dice only, 3 = dice + mode
+  int view = 2;
+  if (stampActive) {
+    unsigned long elapsed = millis() - stampShowStart;
+    if (elapsed < STAMP_PHASE_MS)            view = 0;
+    else if (elapsed < 2 * STAMP_PHASE_MS)   view = 1;
+    else                                     stampActive = false;
+  }
+  if (view == 2 && millis() < modeDisplayUntil) view = 3;
+
+  if (!displayDirty && view == lastView && num == lastNum && num2 == lastNum2 &&
+      (view != 3 || mode == lastMode)) {
+    return; // nothing changed - leave the display alone
   }
 
-  display.showNumberDecEx(num2, 0, false, 1, 3);  // position 3: die 2
+  display.setBrightness(brightness, true);
+
+  if (view == 0) {
+    // 0b01000000 lights the colon/dot after the 2nd digit (if your module has one)
+    display.showNumberDecEx(stampHour * 100 + stampMinute, 0b01000000, true, 4, 0);
+  } else if (view == 1) {
+    display.showNumberDecEx(stampDay * 100 + stampMonth, 0, true, 4, 0);
+  } else {
+    display.showNumberDecEx(num, 0, false, 1, 0);       // position 0: die 1
+    if (view == 3) {
+      display.showNumberDecEx(mode, 0, true, 2, 1);     // positions 1-2: sound mode
+    } else {
+      uint8_t blank[2] = { 0, 0 };
+      display.setSegments(blank, 2, 1);                 // positions 1-2: blank
+    }
+    display.showNumberDecEx(num2, 0, false, 1, 3);      // position 3: die 2
+  }
+
+  lastView = view; lastNum = num; lastNum2 = num2; lastMode = mode;
+  displayDirty = false;
 }
 
 void setup() {
@@ -331,6 +395,7 @@ void setup() {
   pinMode(BUTTON_IN, INPUT_PULLUP); // internal pull-up: button shorts pin to GND when pressed
   // SOUND_POT_PIN needs no pinMode() call - analogRead() handles analog pins directly.
 
+  pinMode(LED_BUILTIN, OUTPUT); // flashes when a timestamp arrives from Python
   Serial.begin(9600);
   display.clear();
 
@@ -340,13 +405,45 @@ void setup() {
   randomSeed(analogRead(A1)); // seed ONCE at startup, not on every roll
 }
 
+// Reads one line from Python. Expected format: "YYYY-MM-DD HH:MM:SS"
+void checkForIncomingTime() {
+  if (Serial.available() > 0) {
+    String incoming = Serial.readStringUntil('\n');
+    incoming.trim();
+
+    // Debug echo so DiceLogger.py can show exactly what the Arduino received
+    Serial.print("RX,");
+    Serial.println(incoming);
+
+    // Ignore anything that doesn't look like a timestamp
+    if (incoming.length() >= 16 && incoming.charAt(4) == '-' && incoming.charAt(13) == ':') {
+      stampMonth  = incoming.substring(5, 7).toInt();
+      stampDay    = incoming.substring(8, 10).toInt();
+      stampHour   = incoming.substring(11, 13).toInt();
+      stampMinute = incoming.substring(14, 16).toInt();
+      stampShowStart = millis();
+      stampActive = true;
+
+      digitalWrite(LED_BUILTIN, HIGH); // flash to confirm receipt
+      delay(150);
+      digitalWrite(LED_BUILTIN, LOW);
+    }
+  }
+}
+
 void loop() {
+  // Check for an incoming timestamp from Python on every pass
+  checkForIncomingTime();
+
   if (checkPressed(rollButton)) {
     Serial.println("Roll button pressed - rolling");
+    stampActive = false; // a new roll cancels any old timestamp still showing
     spinAnimation();
     playerRoll(&dice1, &dice2);
+    // Python's reply is picked up by checkForIncomingTime() on the next pass.
+    // (Don't read Serial here: the reply hasn't arrived yet, and reading it
+    // here would throw it away.)
   }
-
   updateSoundModeFromPot();
   displayNum(dice1, dice2, soundMode);
 }
