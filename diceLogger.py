@@ -1,16 +1,14 @@
 """
-Reads dice rolls from the Arduino Nano over USB serial and saves each one
-into MongoDB.
+Reads dice rolls from the Arduino Nano over USB serial, saves each one into
+MongoDB, and sends the roll's local time back to the Nano.
 
 Install:  pip install pyserial pymongo
 Run:      python DiceLogger.py
 
-Notes:
-  - Close the Arduino IDE Serial Monitor first - only one program can use
-    the COM port at a time. Also stop this script before uploading a new
-    sketch, for the same reason.
-  - MongoDB must already be running on this PC.
+Close the Arduino Serial Monitor first (only one program can use the COM port),
+and stop this script before uploading a new sketch. MongoDB must be running.
 """
+import re
 import sys
 import time
 from datetime import datetime
@@ -25,8 +23,7 @@ MONGO_URI = "mongodb://localhost:27017"
 DB_NAME = "digitalDice"
 COLLECTION_NAME = "rolls"
 
-# Mode number -> name, matching the sound list in the sketch. Only used to
-# store a readable name next to the number; update it if you change the modes.
+# Index = sound mode number, matching the sound list in the sketch.
 SOUND_NAMES = [
     "Silent", "Ascending sweep", "Dice rattle", "Descending arcade sweep",
     "Alternating two-tone clack", "Smooth rising siren", "Chiptune arpeggio",
@@ -35,32 +32,9 @@ SOUND_NAMES = [
     "Typewriter clack with end ding", "Cymbal hiss / shimmer",
 ]
 
-
-def parseRoll(line):
-    """Turn 'ROLL,3,5,7' into (3, 5, 7): die 1, die 2, sound mode.
-    An older sketch that sends only 'ROLL,3,5' still works (mode is None).
-    Returns None for any other line."""
-    if not line.startswith("ROLL,"):
-        return None
-    parts = line.split(",")
-    try:
-        die1, die2 = int(parts[1]), int(parts[2])
-        mode = int(parts[3]) if len(parts) > 3 else None
-    except (ValueError, IndexError):
-        return None
-    if not (1 <= die1 <= 6 and 1 <= die2 <= 6):
-        return None
-    return die1, die2, mode
-
-
-def parseSoundMode(line):
-    """Turn 'Sound mode -> 7' into 7. Returns None for any other line."""
-    if not line.startswith("Sound mode -> "):
-        return None
-    try:
-        return int(line.split("->")[1])
-    except (ValueError, IndexError):
-        return None
+# "ROLL,3,5,7" = die 1, die 2, sound mode. The mode is optional so a roll
+# from an older sketch ("ROLL,3,5") is still saved, just without sound fields.
+ROLL_PATTERN = re.compile(r"ROLL,([1-6]),([1-6])(?:,(\d+))?")
 
 
 def main():
@@ -79,53 +53,33 @@ def main():
     time.sleep(2)  # opening the port resets the Nano; give it time to boot
     print(f"Listening on {SERIAL_PORT} -> {DB_NAME}.{COLLECTION_NAME}. Ctrl+C to stop.")
 
-    lastAnnouncedMode = None  # latest mode seen in a "Sound mode -> N" line
-
     while True:
-        raw = ser.readline().decode("utf-8", errors="ignore").strip()
-        announced = parseSoundMode(raw)
-        if announced is not None:
-            lastAnnouncedMode = announced
-        """print("")"""
-        roll = parseRoll(raw)
-        if roll is None:
-            if raw:
-                print(f"Sent to Arduino: {raw}")  # debug lines from the sketch
+        line = ser.readline().decode("utf-8", errors="ignore").strip()
+        match = ROLL_PATTERN.fullmatch(line)
+        if not match:
+            if line:
+                print(f"Sent to Arduino: {line}")  # other lines from the sketch
             continue
 
-        die1, die2, mode = roll
-        if mode is None:
-            # Older sketch: ROLL line has no mode, so use the last one it announced
-            mode = lastAnnouncedMode
-        if mode is None:
-            soundName = None
-        elif 0 <= mode < len(SOUND_NAMES):
-            soundName = SOUND_NAMES[mode]
-        else:
-            soundName = "Unknown"
+        die1, die2 = int(match[1]), int(match[2])
+        rolledAt = datetime.now()  # local time on this PC
+        doc = {"die1": die1, "die2": die2, "total": die1 + die2, "rolledAt": rolledAt}
+
+        soundNote = ""
+        if match[3] is not None:
+            mode = int(match[3])
+            soundName = SOUND_NAMES[mode] if mode < len(SOUND_NAMES) else "Unknown"
+            doc.update(soundMode=mode, soundName=soundName)
+            soundNote = f" (sound {mode}: {soundName})"
+
         try:
-            rolledAt = datetime.now()  # local time on this PC (no timezone attached)
-            doc = {
-                "die1": die1,
-                "die2": die2,
-                "total": die1 + die2,
-                "rolledAt": rolledAt,
-            }
-            if mode is not None:
-                doc["soundMode"] = mode
-                doc["soundName"] = soundName
             rolls.insert_one(doc)
-            soundNote = (f" (sound {mode}: {soundName})" if mode is not None
-                          else " (sound mode unknown - upload the updated sketch)")
-            print(f"Recieved on Python: Saved roll: {die1} + {die2} = {die1 + die2}{soundNote}")
-            
-            cleanTimeString = rolledAt.strftime('%Y-%m-%d %H:%M:%S')
-    
-            serialMessage = f"{cleanTimeString}\n"
-            ser.write(serialMessage.encode('utf-8'))
-            ser.flush()
         except PyMongoError as err:
             print(f"Failed to save roll {die1},{die2}: {err}")
+            continue
+
+        print(f"Recieved on Python: Saved roll: {die1} + {die2} = {die1 + die2}{soundNote}")
+        ser.write(f"{rolledAt:%Y-%m-%d %H:%M:%S}\n".encode())  # the Nano shows this on its display
 
 
 if __name__ == "__main__":

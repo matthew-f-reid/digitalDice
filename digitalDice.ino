@@ -1,155 +1,81 @@
-#include <Arduino.h>
 #include <TM1637Display.h>
 
-// ---------------- Pin configuration ----------------
-#define CLK               2
-#define DIO               3
-#define BUTTON_IN         7   // rolls the dice
-#define SOUND_POT_PIN     A2  // potentiometer wiper: selects rolling-sound style
-#define SPEAKER_OUT       9
+// ---------------- Pins ----------------
+#define CLK            2
+#define DIO            3
+#define BUTTON_IN      7   // roll button, wired to GND (uses the internal pull-up)
+#define SOUND_POT_PIN  A2  // potentiometer wiper: selects the rolling sound
+#define SPEAKER_OUT    9
 
-// Bit-transfer delay for the TM1637 protocol (microseconds), NOT a "test" value
-#define TM1637_BIT_DELAY   100
+// ---------------- Settings ----------------
+#define TM1637_BIT_DELAY 100  // TM1637 protocol timing (microseconds)
+#define DEBOUNCE_MS      30
+const int brightness = 3;     // display brightness, 0-7
 
-// ---------------- Button debounce ----------------
-#define DEBOUNCE_MS   30
-
-// ---------------- Spin animation timing ----------------
-// Pulled to file scope (not just local to spinAnimation) so playSoundFrame()
-// can compute how far through the whole animation it is, for styles that
-// need a smooth sweep across the entire roll rather than per-frame steps.
+// The roll animation is SPIN_TOTAL_STEPS steps of SPIN_FRAMES_PER_STEP frames (~16 ms each).
 const int SPIN_TOTAL_STEPS     = 10;
 const int SPIN_FRAMES_PER_STEP = 6;
-const int SPIN_TOTAL_FRAMES    = SPIN_TOTAL_STEPS * SPIN_FRAMES_PER_STEP; // 60
+const int SPIN_TOTAL_FRAMES    = SPIN_TOTAL_STEPS * SPIN_FRAMES_PER_STEP;
 
-// ---------------- Sound styles ----------------
-//  0 = silent
-//  1 = ascending sweep
-//  2 = dice-rattle (random short clicks)
-//  3 = descending arcade sweep
-//  4 = alternating two-tone clack
-//  5 = smooth rising siren
-//  6 = chiptune arpeggio
-//  7 = laser zap (fast descending per step)
-//  8 = bell / chime (one note per step)
-//  9 = robot beep-boop (slow alternating pitch)
-// 10 = casino jackpot trill
-// 11 = wind-up spring (stepped rising pitch)
-// 12 = xylophone (random pentatonic notes)
-// 13 = sci-fi power-up (wide smooth rise)
-// 14 = typewriter clack + end ding
-// 15 = cymbal hiss / shimmer
-#define NUM_SOUND_MODES 16
-int soundMode = 2; // updated continuously from the potentiometer position
+const unsigned long MODE_DISPLAY_MS = 2000;  // how long the sound mode number stays on screen
+const unsigned long STAMP_PHASE_MS  = 2000;  // after a roll: time, then date, each shown this long
 
-// ---------------- Display segment frames for the spin animation ----------------
-// Each row is one rotating "spinner" frame (a single lit segment moving across
-// all 4 digit positions at once), replacing six near-duplicate arrays from an
-// earlier version.
-const uint8_t spinnerFrames[6][4] = {
-  { SEG_A, SEG_B, SEG_C, SEG_D },
-  { SEG_B, SEG_C, SEG_D, SEG_E },
-  { SEG_C, SEG_D, SEG_E, SEG_F },
-  { SEG_D, SEG_E, SEG_F, SEG_A },
-  { SEG_E, SEG_F, SEG_A, SEG_B },
-  { SEG_F, SEG_A, SEG_B, SEG_C }
-};
-
-TM1637Display display(CLK, DIO, TM1637_BIT_DELAY);
-
-int brightness = 3;
-int dice1 = 1, dice2 = 1;   // start at a valid value so power-up doesn't show 0/0
-bool displayDirty = true;   // set true whenever the display was wiped/changed outside displayNum()
-
-// Small helper struct so both buttons share the same debounce/edge-detect logic
-struct DebouncedButton {
-  uint8_t pin;
-  bool lastReading;
-  bool actionTaken;
-  unsigned long lastDebounceTime;
-};
-
-DebouncedButton rollButton = { BUTTON_IN, false, false, 0 };
-
-// Smoothed potentiometer reading, used to pick the sound style. A simple
-// low-pass filter (weighted running average) keeps a noisy ADC reading from
-// making soundMode flicker between two values near a threshold.
-int smoothedPot = 512; // start at the middle of the 0-1023 ADC range
-
-// Most potentiometers don't electrically sweep the full ideal 0-1023 ADC
-// range in practice (wiring resistance, wiper contact, unit tolerance). These
-// track the REAL observed min/max as the knob gets used, so "fully one way"
-// and "fully the other way" always reach mode 0 and the last mode - whatever
-// the pot's actual range turns out to be. Sweep the knob fully a couple of
-// times after flashing so these settle to the true endpoints.
-int potMin = 1023;
-int potMax = 0;
-
-// Hysteresis margin around the CURRENT mode's zone, as a fraction of that
-// zone's width (not a fixed ADC count) - a reading has to clearly leave the
-// current zone by more than this before a change is even considered, which
-// stops noise sitting right on a boundary from flip-flopping between modes.
-// A FIXED count margin can end up larger than a zone itself if the pot's
-// real calibrated range is narrower than expected, which makes the
-// outermost zones (mode 0, mode NUM_SOUND_MODES-1) unreachable - scaling by
-// zone width avoids that regardless of how wide the pot's actual range is.
+// Dial: sampled every POT_SAMPLE_MS, and a new mode must hold for POT_SETTLE_MS.
+// A reading must leave the current mode's zone by POT_ZONE_MARGIN_FRACTION of
+// a zone's width before a change is considered (stops flicker on zone edges).
+const unsigned long POT_SAMPLE_MS = 5;
+const unsigned long POT_SETTLE_MS = 60;
 const float POT_ZONE_MARGIN_FRACTION = 0.25f;
 
-// The mapped mode value has to hold steady for this long before it's
-// actually applied. Without this, tiny electrical noise near a zone
-// boundary (e.g. coupled in from the display's CLK/DIO lines) can nudge the
-// reading back and forth across the boundary and make the mode flicker
-// between two values with the dial completely untouched.
-const unsigned long POT_SETTLE_MS = 60;
-// The pot is sampled on a fixed timer (not once per loop pass) so the amount
-// of smoothing doesn't depend on how fast the loop happens to run.
-const unsigned long POT_SAMPLE_MS = 5;
-int candidateMode = 2;
+// Sound modes: 0 silent, 1 ascending sweep, 2 dice rattle, 3 descending arcade sweep,
+// 4 two-tone clack, 5 rising siren, 6 chiptune arpeggio, 7 laser zap, 8 bell,
+// 9 robot beep-boop, 10 jackpot trill, 11 wind-up spring, 12 xylophone,
+// 13 sci-fi power-up, 14 typewriter + ding, 15 cymbal hiss
+#define NUM_SOUND_MODES 16
+
+// ---------------- State ----------------
+TM1637Display display(CLK, DIO, TM1637_BIT_DELAY);
+
+int soundMode = 2;
+int dice1 = 1, dice2 = 1;
+bool displayDirty = true;  // forces a redraw (set whenever the display is wiped)
+
+// Button debounce
+bool lastReading, buttonHandled;
+unsigned long lastChangeTime;
+
+// Dial. potMin/potMax learn the dial's real range as it is turned, so sweep
+// the knob fully after each reset.
+int smoothedPot = 512, potMin = 1023, potMax = 0, candidateMode = 2;
 unsigned long candidateSince = 0;
-
-// While millis() is before this timestamp, the center two digits show the
-// current sound mode; once it passes, they go blank and only the dice show.
-// Set 2000ms into the future whenever the mode changes (and once at boot).
 unsigned long modeDisplayUntil = 0;
-const unsigned long MODE_DISPLAY_MS = 2000;
 
-// Returns true exactly once per fresh press (after debounce), false otherwise.
-// With INPUT_PULLUP, the pin reads LOW when pressed.
-bool checkPressed(DebouncedButton &btn) {
-  bool reading = (digitalRead(btn.pin) == LOW);
-  bool firedThisCall = false;
+// Time and date sent back by DiceLogger.py, stored as HHMM and DDMM
+int stampTime = 0, stampDate = 0;
+unsigned long stampStart = 0;
+bool stampActive = false;
 
-  if (reading != btn.lastReading) {
-    btn.lastDebounceTime = millis();
+// ---------------- Button ----------------
+// True exactly once per debounced press (the pin reads LOW when pressed).
+bool buttonPressed() {
+  bool reading = (digitalRead(BUTTON_IN) == LOW);
+  bool fired = false;
+
+  if (reading != lastReading) lastChangeTime = millis();
+
+  if (millis() - lastChangeTime > DEBOUNCE_MS) {
+    fired = reading && !buttonHandled;
+    buttonHandled = reading;
   }
 
-  if ((millis() - btn.lastDebounceTime) > DEBOUNCE_MS) {
-    if (reading && !btn.actionTaken) {
-      firedThisCall = true;
-      btn.actionTaken = true;
-    } else if (!reading) {
-      btn.actionTaken = false;
-    }
-  }
-
-  btn.lastReading = reading;
-  return firedThisCall;
+  lastReading = reading;
+  return fired;
 }
 
-// Call once in setup(), after pinMode(), to sync a button's debounce state
-// with its REAL electrical state at boot. Without this, the struct's
-// hard-coded "not pressed" default can mismatch the true pin voltage during
-// power-up/reset, which gets misread as a fresh press on the very first loop.
-void initButtonState(DebouncedButton &btn) {
-  bool reading = (digitalRead(btn.pin) == LOW);
-  btn.lastReading = reading;
-  btn.actionTaken = reading; // if it's already held down at boot, don't fire
-  btn.lastDebounceTime = millis();
-}
-
-// ---------------- Sound helpers ----------------
+// ---------------- Sound ----------------
+// Called once per animation frame: frame is 0-5, step is 0-9.
 void playSoundFrame(int frame, int step) {
-  int combined = step * SPIN_FRAMES_PER_STEP + frame; // 0..(SPIN_TOTAL_FRAMES-1)
+  int combined = step * SPIN_FRAMES_PER_STEP + frame;  // 0..59, progress through the whole roll
 
   switch (soundMode) {
     case 0:  // silent
@@ -164,7 +90,7 @@ void playSoundFrame(int frame, int step) {
       }
       break;
 
-    case 2:  // dice-rattle: short random-pitched clicks
+    case 2:  // dice rattle: short random clicks
       tone(SPEAKER_OUT, random(300, 1200), 12);
       break;
 
@@ -176,23 +102,21 @@ void playSoundFrame(int frame, int step) {
       tone(SPEAKER_OUT, (frame % 2 == 0) ? 440 : 660, 20);
       break;
 
-    case 5: { // smooth rising siren across the whole animation
-      int freq = 300 + (int)(700L * combined / (SPIN_TOTAL_FRAMES - 1));
-      tone(SPEAKER_OUT, freq, 18);
+    case 5:  // smooth rising siren
+      tone(SPEAKER_OUT, 300 + (int)(700L * combined / (SPIN_TOTAL_FRAMES - 1)), 18);
       break;
-    }
 
-    case 6: { // chiptune arpeggio
+    case 6: {  // chiptune arpeggio
       const int notes[4] = { 262, 330, 392, 523 };
       tone(SPEAKER_OUT, notes[frame % 4], 14);
       break;
     }
 
-    case 7: // laser zap: fast descending sweep within each step
+    case 7:  // laser zap: fast descending sweep within each step
       tone(SPEAKER_OUT, 1200 - frame * 150, 10);
       break;
 
-    case 8: // bell / chime: one note per step
+    case 8:  // bell: one note per step
       if (frame == 0) {
         tone(SPEAKER_OUT, 600 + step * 30, 80);
       } else {
@@ -200,31 +124,29 @@ void playSoundFrame(int frame, int step) {
       }
       break;
 
-    case 9: // robot beep-boop: slow alternating pitch by step
+    case 9:  // robot beep-boop: alternates every step
       tone(SPEAKER_OUT, (step % 2 == 0) ? 300 : 900, 60);
       break;
 
-    case 10: // casino jackpot trill
+    case 10:  // casino jackpot trill
       tone(SPEAKER_OUT, 500 + frame * 80, 10);
       break;
 
-    case 11: // wind-up spring: pitch steps up once per step, not per frame
+    case 11:  // wind-up spring: pitch climbs in stairs
       tone(SPEAKER_OUT, 300 + step * 70, 16);
       break;
 
-    case 12: { // xylophone: random pentatonic notes
+    case 12: {  // xylophone: random pentatonic notes
       const int notes[5] = { 392, 440, 494, 587, 659 };
       tone(SPEAKER_OUT, notes[random(0, 5)], 20);
       break;
     }
 
-    case 13: { // sci-fi power-up: wide smooth rise
-      int freq = 150 + (int)(1850L * combined / (SPIN_TOTAL_FRAMES - 1));
-      tone(SPEAKER_OUT, freq, 18);
+    case 13:  // sci-fi power-up: wide smooth rise
+      tone(SPEAKER_OUT, 150 + (int)(1850L * combined / (SPIN_TOTAL_FRAMES - 1)), 18);
       break;
-    }
 
-    case 14: // typewriter clack + end ding
+    case 14:  // typewriter clacks, then a ding on the last frame
       if (step == SPIN_TOTAL_STEPS - 1 && frame == SPIN_FRAMES_PER_STEP - 1) {
         tone(SPEAKER_OUT, 1800, 100);
       } else {
@@ -232,57 +154,32 @@ void playSoundFrame(int frame, int step) {
       }
       break;
 
-    case 15: // cymbal hiss / shimmer
+    case 15:  // cymbal hiss
       tone(SPEAKER_OUT, random(2500, 6000), 4);
       break;
   }
 }
 
-// Short confirmation chirp whenever the potentiometer moves into a new
-// sound-mode zone, plus a print so you can see which mode you landed on
-// over Serial (the number is also always visible on the dice display now).
-void confirmSoundModeChange() {
-  Serial.print("Sound mode -> ");
-  Serial.println(soundMode);
-
-  tone(SPEAKER_OUT, 700 + soundMode * 90, 60); // tone() with a duration doesn't block
-}
-
-// Reads the potentiometer, smooths it, and maps it onto the sound-mode
-// range using the auto-calibrated potMin/potMax. A newly-mapped value only
-// becomes a candidate once the reading has clearly left the CURRENT mode's
-// zone (past POT_ZONE_MARGIN), and only becomes the active soundMode once
-// that candidate has held steady for POT_SETTLE_MS. Together these stop
-// noise sitting right on a zone boundary from endlessly flip-flopping
-// between two adjacent modes.
+// ---------------- Dial ----------------
 void updateSoundModeFromPot() {
   static unsigned long lastSample = 0;
   if (millis() - lastSample < POT_SAMPLE_MS) return;
   lastSample = millis();
 
-  int raw = analogRead(SOUND_POT_PIN);
-  smoothedPot = (smoothedPot * 3 + raw) / 4; // light low-pass; hysteresis does the heavy lifting
-
+  smoothedPot = (smoothedPot * 3 + analogRead(SOUND_POT_PIN)) / 4;
   if (smoothedPot < potMin) potMin = smoothedPot;
   if (smoothedPot > potMax) potMax = smoothedPot;
-  if (potMax <= potMin) return; // not enough range observed yet
+  if (potMax <= potMin) return;  // not enough range seen yet
 
-  // Split the usable range into NUM_SOUND_MODES EQUAL zones. (Arduino's map()
-  // can't be used for this: with an output of 0..N-1 it only returns the
-  // top value when the input is exactly at its maximum, so the first and last
-  // modes end up one ADC count wide and almost impossible to land on.)
-  // A small trim at each end means the extreme modes still work when noise
-  // has stretched the learned min/max slightly.
-  int trim = (potMax - potMin) / 32;     // about 3% at each end
+  // Split the usable range (ignoring ~3% at each end) into equal zones, one per mode.
+  int trim = (potMax - potMin) / 32;
   int lo = potMin + trim;
   int hi = potMax - trim;
   int usable = hi - lo + 1;
-  if (usable < 1) return;
-
   int pos = constrain(smoothedPot, lo, hi) - lo;
   int mapped = (int)((long)pos * NUM_SOUND_MODES / usable);
-  mapped = constrain(mapped, 0, NUM_SOUND_MODES - 1);
 
+  // The current mode's zone, widened by the hysteresis margin.
   float zoneWidth = (float)usable / NUM_SOUND_MODES;
   int margin = (int)(zoneWidth * POT_ZONE_MARGIN_FRACTION);
   int zoneLow  = lo + (int)(soundMode * zoneWidth) - margin;
@@ -294,26 +191,28 @@ void updateSoundModeFromPot() {
       candidateSince = millis();
     }
   } else {
-    candidateMode = soundMode; // still within current zone's margin - cancel any pending change
+    candidateMode = soundMode;  // still inside the current zone: cancel any pending change
   }
 
-  if (candidateMode != soundMode && (millis() - candidateSince) > POT_SETTLE_MS) {
+  if (candidateMode != soundMode && millis() - candidateSince > POT_SETTLE_MS) {
     soundMode = candidateMode;
-    confirmSoundModeChange();
+    Serial.print("Sound mode -> ");
+    Serial.println(soundMode);
+    tone(SPEAKER_OUT, 700 + soundMode * 90, 60);  // confirmation chirp
     modeDisplayUntil = millis() + MODE_DISPLAY_MS;
   }
 }
 
-// ---------------- Core logic ----------------
-void playerRoll(int *die1, int *die2) {
-  *die1 = random(1, 7);
-  *die2 = random(1, 7);
+// ---------------- Rolling ----------------
+void rollDice() {
+  dice1 = random(1, 7);
+  dice2 = random(1, 7);
 
-  // Machine-readable line for DiceLogger.py: ROLL,<die1>,<die2>,<sound mode>
+  // Read by DiceLogger.py: ROLL,<die1>,<die2>,<sound mode>
   Serial.print("ROLL,");
-  Serial.print(*die1);
+  Serial.print(dice1);
   Serial.print(",");
-  Serial.print(*die2);
+  Serial.print(dice2);
   Serial.print(",");
   Serial.println(soundMode);
 }
@@ -321,9 +220,15 @@ void playerRoll(int *die1, int *die2) {
 void spinAnimation() {
   for (int step = 0; step < SPIN_TOTAL_STEPS; step++) {
     for (int frame = 0; frame < SPIN_FRAMES_PER_STEP; frame++) {
-      display.setSegments(spinnerFrames[frame]);
+      // Each digit lights one of the six outer segments (A-F are bits 0-5),
+      // shifted by one per digit, so the segments appear to chase around.
+      uint8_t segments[4];
+      for (int digit = 0; digit < 4; digit++) {
+        segments[digit] = 1 << ((frame + digit) % 6);
+      }
+      display.setSegments(segments);
       playSoundFrame(frame, step);
-      delay(16); // brief pause so the spin is visible/audible
+      delay(16);
     }
   }
   noTone(SPEAKER_OUT);
@@ -331,119 +236,104 @@ void spinAnimation() {
   displayDirty = true;
 }
 
-// ---------------- Roll timestamp sent back by Python ----------------
-// After saving a roll, DiceLogger.py replies with "YYYY-MM-DD HH:MM:SS".
-// The 4-digit display can't show all of that, so it shows the time (HH:MM)
-// for STAMP_PHASE_MS, then the date (DDMM) for STAMP_PHASE_MS, then goes
-// back to the dice.
-int stampHour = 0, stampMinute = 0, stampDay = 0, stampMonth = 0;
-unsigned long stampShowStart = 0;
-bool stampActive = false;
-const unsigned long STAMP_PHASE_MS = 2000;
+// ---------------- Display ----------------
+// Dice on the outer digits, the sound mode on the two centre digits for
+// MODE_DISPLAY_MS after it changes. After a roll the time, then the date,
+// take over all four digits. The display is only rewritten when something
+// visible changed, because every redraw is slow (several ms) and would make
+// the loop, and so the dial, laggy.
+void updateDisplay() {
+  static int lastView = -1, lastDie1 = -1, lastDie2 = -1, lastMode = -1;
 
-// Uses all 4 digits of the TM1637: die 1 on the far left, die 2 on the far
-// right, always. The two center digits show the current sound mode (0-15,
-// with a leading zero so it fills both positions) only for MODE_DISPLAY_MS
-// after it last changed - otherwise they're left blank so just the dice show.
-// While a roll timestamp is being shown, it takes over the whole display.
-//
-// The display is only rewritten when something visible changed. Redrawing it
-// on every pass of loop() made the loop slow (every redraw is several ms of
-// bit-banged TM1637 traffic), which delayed pot changes appearing on screen.
-void displayNum(int num, int num2, int mode) {
-  static int lastView = -1, lastNum = -1, lastNum2 = -1, lastMode = -1;
-
-  // 0 = timestamp time, 1 = timestamp date, 2 = dice only, 3 = dice + mode
+  // 0 = time, 1 = date, 2 = dice only, 3 = dice + sound mode
   int view = 2;
   if (stampActive) {
-    unsigned long elapsed = millis() - stampShowStart;
-    if (elapsed < STAMP_PHASE_MS)            view = 0;
-    else if (elapsed < 2 * STAMP_PHASE_MS)   view = 1;
-    else                                     stampActive = false;
+    unsigned long elapsed = millis() - stampStart;
+    if (elapsed < STAMP_PHASE_MS)          view = 0;
+    else if (elapsed < 2 * STAMP_PHASE_MS) view = 1;
+    else                                   stampActive = false;
   }
   if (view == 2 && millis() < modeDisplayUntil) view = 3;
 
-  if (!displayDirty && view == lastView && num == lastNum && num2 == lastNum2 &&
-      (view != 3 || mode == lastMode)) {
-    return; // nothing changed - leave the display alone
+  if (!displayDirty && view == lastView && dice1 == lastDie1 && dice2 == lastDie2 &&
+      (view != 3 || soundMode == lastMode)) {
+    return;
   }
-
-  display.setBrightness(brightness, true);
 
   if (view == 0) {
-    // 0b01000000 lights the colon/dot after the 2nd digit (if your module has one)
-    display.showNumberDecEx(stampHour * 100 + stampMinute, 0b01000000, true, 4, 0);
+    display.showNumberDecEx(stampTime, 0b01000000, true, 4, 0);  // HH:MM (colon if the module has one)
   } else if (view == 1) {
-    display.showNumberDecEx(stampDay * 100 + stampMonth, 0, true, 4, 0);
+    display.showNumberDecEx(stampDate, 0, true, 4, 0);           // DDMM
   } else {
-    display.showNumberDecEx(num, 0, false, 1, 0);       // position 0: die 1
+    display.showNumberDecEx(dice1, 0, false, 1, 0);
     if (view == 3) {
-      display.showNumberDecEx(mode, 0, true, 2, 1);     // positions 1-2: sound mode
+      display.showNumberDecEx(soundMode, 0, true, 2, 1);
     } else {
-      uint8_t blank[2] = { 0, 0 };
-      display.setSegments(blank, 2, 1);                 // positions 1-2: blank
+      const uint8_t blank[2] = { 0, 0 };
+      display.setSegments(blank, 2, 1);
     }
-    display.showNumberDecEx(num2, 0, false, 1, 3);      // position 3: die 2
+    display.showNumberDecEx(dice2, 0, false, 1, 3);
   }
 
-  lastView = view; lastNum = num; lastNum2 = num2; lastMode = mode;
+  lastView = view;
+  lastDie1 = dice1;
+  lastDie2 = dice2;
+  lastMode = soundMode;
   displayDirty = false;
 }
 
-void setup() {
-  pinMode(SPEAKER_OUT, OUTPUT);
-  pinMode(BUTTON_IN, INPUT_PULLUP); // internal pull-up: button shorts pin to GND when pressed
-  // SOUND_POT_PIN needs no pinMode() call - analogRead() handles analog pins directly.
+// ---------------- Timestamp from Python ----------------
+// Reads one line in the form "YYYY-MM-DD HH:MM:SS".
+void checkForIncomingTime() {
+  if (Serial.available() == 0) return;
 
-  pinMode(LED_BUILTIN, OUTPUT); // flashes when a timestamp arrives from Python
-  Serial.begin(9600);
-  display.clear();
+  String incoming = Serial.readStringUntil('\n');
+  incoming.trim();
 
-  initButtonState(rollButton);
-  modeDisplayUntil = millis() + MODE_DISPLAY_MS; // show the startup sound mode briefly too
+  Serial.print("RX,");  // echo, so DiceLogger.py can show what arrived
+  Serial.println(incoming);
 
-  randomSeed(analogRead(A1)); // seed ONCE at startup, not on every roll
+  if (incoming.length() < 16 || incoming.charAt(4) != '-' || incoming.charAt(13) != ':') return;
+
+  stampDate = incoming.substring(8, 10).toInt() * 100 + incoming.substring(5, 7).toInt();
+  stampTime = incoming.substring(11, 13).toInt() * 100 + incoming.substring(14, 16).toInt();
+  stampStart = millis();
+  stampActive = true;
+
+  digitalWrite(LED_BUILTIN, HIGH);  // flash the onboard LED to confirm receipt
+  delay(150);
+  digitalWrite(LED_BUILTIN, LOW);
 }
 
-// Reads one line from Python. Expected format: "YYYY-MM-DD HH:MM:SS"
-void checkForIncomingTime() {
-  if (Serial.available() > 0) {
-    String incoming = Serial.readStringUntil('\n');
-    incoming.trim();
+// ---------------- Main ----------------
+void setup() {
+  pinMode(SPEAKER_OUT, OUTPUT);
+  pinMode(BUTTON_IN, INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT);
+  Serial.begin(9600);  // must match BAUD_RATE in DiceLogger.py
 
-    // Debug echo so DiceLogger.py can show exactly what the Arduino received
-    Serial.print("RX,");
-    Serial.println(incoming);
+  display.setBrightness(brightness);
+  display.clear();
 
-    // Ignore anything that doesn't look like a timestamp
-    if (incoming.length() >= 16 && incoming.charAt(4) == '-' && incoming.charAt(13) == ':') {
-      stampMonth  = incoming.substring(5, 7).toInt();
-      stampDay    = incoming.substring(8, 10).toInt();
-      stampHour   = incoming.substring(11, 13).toInt();
-      stampMinute = incoming.substring(14, 16).toInt();
-      stampShowStart = millis();
-      stampActive = true;
+  // Start the debounce from the pin's real state so a pin that reads LOW at
+  // boot isn't mistaken for a press.
+  lastReading = buttonHandled = (digitalRead(BUTTON_IN) == LOW);
+  lastChangeTime = millis();
 
-      digitalWrite(LED_BUILTIN, HIGH); // flash to confirm receipt
-      delay(150);
-      digitalWrite(LED_BUILTIN, LOW);
-    }
-  }
+  modeDisplayUntil = millis() + MODE_DISPLAY_MS;  // show the starting mode briefly
+  randomSeed(analogRead(A1));                     // unconnected pin: noise gives a different seed each boot
 }
 
 void loop() {
-  // Check for an incoming timestamp from Python on every pass
   checkForIncomingTime();
 
-  if (checkPressed(rollButton)) {
+  if (buttonPressed()) {
     Serial.println("Roll button pressed - rolling");
-    stampActive = false; // a new roll cancels any old timestamp still showing
+    stampActive = false;  // a new roll cancels any timestamp still showing
     spinAnimation();
-    playerRoll(&dice1, &dice2);
-    // Python's reply is picked up by checkForIncomingTime() on the next pass.
-    // (Don't read Serial here: the reply hasn't arrived yet, and reading it
-    // here would throw it away.)
+    rollDice();
   }
+
   updateSoundModeFromPot();
-  displayNum(dice1, dice2, soundMode);
+  updateDisplay();
 }

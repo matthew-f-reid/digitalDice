@@ -104,7 +104,7 @@ If your display module has a colon, it lights between the hour and minute digits
 | Line | When | Used by the logger |
 |---|---|---|
 | `ROLL,3,5,7` | After every roll: die 1, die 2, selected sound mode | Yes, saved to MongoDB |
-| `Sound mode -> 7` | Whenever the dial moves into a new mode | Remembered as the latest mode (fallback if a roll line has no mode) |
+| `Sound mode -> 7` | Whenever the dial moves into a new mode | Printed only |
 | `Roll button pressed - rolling` | Start of a roll | Printed only |
 | `RX,2026-10-12 18:23:45` | Echo of every line the Nano receives from the PC | Printed only (confirms the timestamp arrived) |
 
@@ -130,7 +130,7 @@ Sent right after a roll is saved. It is the PC's local time in `YYYY-MM-DD HH:MM
 
   This works from any folder and installs globally. If `pip` isn't recognised on Windows, use `python -m pip install pyserial pymongo`. To keep the packages scoped to this project, create a virtual environment first (`python -m venv venv`, then `venv\Scripts\activate`).
 - MongoDB running on the PC (default `mongodb://localhost:27017`). MongoDB Compass is handy for viewing the data.
-- The current sketch uploaded to the Nano. It must print `ROLL,x,y,mode`. An older sketch that prints only `ROLL,x,y` still works, but the sound mode then comes from the last `Sound mode -> N` line. The oldest format (`Rolled: x and y`) is ignored.
+- The current sketch uploaded to the Nano. It must print `ROLL,x,y,mode`. An older sketch that prints only `ROLL,x,y` still saves rolls, but without the sound fields. The oldest format (`Rolled: x and y`) is ignored.
 
 ### Setup and run
 
@@ -158,7 +158,7 @@ Database `digitalDice`, collection `rolls`. One document per roll:
 ```
 
 - `soundName` comes from the `SOUND_NAMES` list at the top of `DiceLogger.py`. Update that list if you change the sound modes in the sketch.
-- If the mode isn't known yet (an older sketch, and no dial movement since the Nano reset), the roll is saved without the two sound fields and the script says so.
+- If the roll line carries no mode (an older sketch), the roll is saved without the two sound fields.
 - `rolledAt` is saved in the PC's **local** time. MongoDB dates carry no timezone, so Compass labels it with a trailing `Z` (UTC) even though it is local time. Rolls saved before this change are in UTC.
 - The database and collection are created on the first insert. In MongoDB Compass, click the refresh button to see new rolls; it doesn't update automatically.
 
@@ -208,6 +208,6 @@ Estimated draw is roughly 100–150 mA on average, so a 6-hour session needs abo
 | Script exits with `Can't open COMx` | Wrong port, or the Serial Monitor or another program is holding it |
 | Script exits with `Can't reach MongoDB` | MongoDB isn't running on the PC, or `MONGO_URI` is wrong |
 | "Saved roll" prints but nothing shows in Compass | Click refresh in Compass and check you're connected to the same server, database `digitalDice`, collection `rolls` |
-| Saved roll has no sound mode, and the script says the mode is unknown | The board is running an older sketch and the dial hasn't moved since the last reset. Upload the current sketch, or turn the dial once |
+| Saved roll has no `soundMode` or `soundName` | The board is running an older sketch that doesn't send the mode. Upload the current sketch |
 | Time and date don't appear on the display after a roll | Check the script is running and prints `RX,<timestamp>` after the roll. If `RX,` doesn't appear, the Nano isn't receiving (old sketch, or wrong port). If it appears and the display doesn't change, check the sketch is the current one |
 | Displayed time is wrong | The time comes from the PC's clock. Check the PC's date, time and timezone |
