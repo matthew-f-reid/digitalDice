@@ -55,7 +55,7 @@ Notes:
 
 - **Roll:** press the button. The display spins while the selected sound plays, then both dice show.
 - **Change sound:** turn the dial. The new mode number appears on the center two digits for 2 seconds (it also appears for 2 seconds at power-up) and a short confirmation chirp plays.
-- **Timestamp:** with `DiceLogger.py` running, the PC replies to each roll with the time and date. After the dice appear, the display shows the time (`HH:MM`) for 2 seconds, then the date (`DDMM`, for example `1210` for 12 October) for 2 seconds, then returns to the dice. The Nano's onboard LED also blinks when a timestamp arrives. Without the script running, nothing is shown and the dice stay on screen. Pressing the button again cancels a timestamp that is still showing.
+- **Timestamp:** with `diceLogger.py` running, the PC replies to each roll with the time and date. After the dice appear, the display shows the time (`HH:MM`) for 2 seconds, then the date (`DDMM`, for example `1210` for 12 October) for 2 seconds, then returns to the dice. The Nano's onboard LED also blinks when a timestamp arrives. Without the script running, nothing is shown and the dice stay on screen. Pressing the button again cancels a timestamp that is still showing.
 - **Calibrate the dial:** after flashing, sweep the pot fully to both ends a couple of times. The sketch learns the pot's real min and max as you use it, so the first and last modes become reachable.
 
 ### Display layout
@@ -118,7 +118,7 @@ Sent right after a roll is saved. It is the PC's local time in `YYYY-MM-DD HH:MM
 
 ## Logging rolls to MongoDB (PC side)
 
-`DiceLogger.py` reads the `ROLL` lines from the Nano over USB serial, saves each roll into a local MongoDB database, and sends the roll's timestamp back to the Nano.
+`diceLogger.py` reads the `ROLL` lines from the Nano over USB serial, saves each roll into a local MongoDB database, and sends the roll's timestamp back to the Nano.
 
 ### Requirements
 
@@ -134,12 +134,12 @@ Sent right after a roll is saved. It is the PC's local time in `YYYY-MM-DD HH:MM
 
 ### Setup and run
 
-1. Open `DiceLogger.py` and set `SERIAL_PORT` to the Nano's port (Arduino IDE > Tools > Port, e.g. `COM6`). The number can change if you plug into a different USB port.
+1. Open `diceLogger.py` and set `SERIAL_PORT` to the Nano's port (Arduino IDE > Tools > Port, e.g. `COM6`). The number can change if you plug into a different USB port.
 2. Close the Arduino Serial Monitor. Only one program can use the port at a time, so also stop the script before uploading a new sketch.
 3. Run:
 
    ```
-   python DiceLogger.py
+   python diceLogger.py
    ```
 
    It prints `Listening on COM6 -> digitalDice.rolls`. Opening the port resets the Nano, so it waits 2 seconds before listening.
@@ -157,14 +157,14 @@ Database `digitalDice`, collection `rolls`. One document per roll:
 }
 ```
 
-- `soundName` comes from the `SOUND_NAMES` list at the top of `DiceLogger.py`. Update that list if you change the sound modes in the sketch.
+- `soundName` comes from the `SOUND_NAMES` list at the top of `diceLogger.py`. Update that list if you change the sound modes in the sketch.
 - If the roll line carries no mode (an older sketch), the roll is saved without the two sound fields.
 - `rolledAt` is saved in the PC's **local** time. MongoDB dates carry no timezone, so Compass labels it with a trailing `Z` (UTC) even though it is local time. Rolls saved before this change are in UTC.
 - The database and collection are created on the first insert. In MongoDB Compass, click the refresh button to see new rolls; it doesn't update automatically.
 
 ### Script settings
 
-At the top of `DiceLogger.py`:
+At the top of `diceLogger.py`:
 
 | Setting | Default | What it does |
 |---|---|---|

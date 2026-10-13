@@ -50,7 +50,7 @@ int smoothedPot = 512, potMin = 1023, potMax = 0, candidateMode = 2;
 unsigned long candidateSince = 0;
 unsigned long modeDisplayUntil = 0;
 
-// Time and date sent back by DiceLogger.py, stored as HHMM and DDMM
+// Time and date sent back by diceLogger.py, stored as HHMM and DDMM
 int stampTime = 0, stampDate = 0;
 unsigned long stampStart = 0;
 bool stampActive = false;
@@ -208,7 +208,7 @@ void rollDice() {
   dice1 = random(1, 7);
   dice2 = random(1, 7);
 
-  // Read by DiceLogger.py: ROLL,<die1>,<die2>,<sound mode>
+  // Read by diceLogger.py: ROLL,<die1>,<die2>,<sound mode>
   Serial.print("ROLL,");
   Serial.print(dice1);
   Serial.print(",");
@@ -290,7 +290,7 @@ void checkForIncomingTime() {
   String incoming = Serial.readStringUntil('\n');
   incoming.trim();
 
-  Serial.print("RX,");  // echo, so DiceLogger.py can show what arrived
+  Serial.print("RX,");  // echo, so diceLogger.py can show what arrived
   Serial.println(incoming);
 
   if (incoming.length() < 16 || incoming.charAt(4) != '-' || incoming.charAt(13) != ':') return;
@@ -310,7 +310,7 @@ void setup() {
   pinMode(SPEAKER_OUT, OUTPUT);
   pinMode(BUTTON_IN, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
-  Serial.begin(9600);  // must match BAUD_RATE in DiceLogger.py
+  Serial.begin(9600);  // must match BAUD_RATE in diceLogger.py
 
   display.setBrightness(brightness);
   display.clear();

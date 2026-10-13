@@ -3,7 +3,7 @@ Reads dice rolls from the Arduino Nano over USB serial, saves each one into
 MongoDB, and sends the roll's local time back to the Nano.
 
 Install:  pip install pyserial pymongo
-Run:      python DiceLogger.py
+Run:      python diceLogger.py
 
 Close the Arduino Serial Monitor first (only one program can use the COM port),
 and stop this script before uploading a new sketch. MongoDB must be running.
